@@ -45,6 +45,23 @@ def get_date_range(**context):
     end_date = context["data_interval_end"]
     return start_date, end_date
 
+def file_exists_in_minio(con, s3_path):
+    """
+    Проверяет существование файла в MinIO через DuckDB.
+    Возвращает True если файл существует и читается.
+    """
+    try:
+        # Пытаемся прочитать первую запись (быстрая проверка)
+        con.execute(f"SELECT 1 FROM read_parquet('{s3_path}') LIMIT 1'").fetchone()
+        return True
+    except Exception as e:
+        error_msg = str(e).lower()
+        # Ожидаемые ошибки - файл не найден
+        if "404" in error_msg or "no such file" in error_msg or "not found" in error_msg or "no files found" in error_msg:
+            return False
+        # Неожиданная ошибка - логируем, но считаем что файла нет
+        logging.warning(f"Неожиданная ошибка при проверке {s3_path}: {e}")
+        return False
 
 def load_monthly_earthquake_data(**context):
     """
@@ -63,19 +80,42 @@ def load_monthly_earthquake_data(**context):
     year = start_date.year
     month = start_date.month
 
+    # Путь к файлу в MinIO
+    s3_path = f"s3://prod/{LAYER}/{SOURCE}/year={year}/month={month:02d}/earthquakes_{start_str}.parquet"
+
     logging.info(f"💻 Загружаю данные за {start_str} - {end_str} (M > 4.5)")
 
     con = duckdb.connect()
 
     try:
+        # Настраиваем DuckDB
+        con.execute("""
+                    INSTALL httpfs;
+                    LOAD httpfs;
+                    INSTALL json;
+                    LOAD json;
+                """)
+        con.execute(f"""
+                    SET s3_url_style = 'path';
+                    SET s3_endpoint = 'minio:9000';
+                    SET s3_access_key_id = '{ACCESS_KEY}';
+                    SET s3_secret_access_key = '{SECRET_KEY}';
+                    SET s3_use_ssl = FALSE;
+                """)
+
+        # ============================================
+        # ✅ ПРОВЕРКА: существует ли уже файл в MinIO?
+        # ============================================
+        if file_exists_in_minio(con, s3_path):
+            logging.info(f"⏭️ Файл уже существует, пропускаем: {s3_path}")
+            return
+
         # Формируем URL с фильтром по магнитуде
         url = f"https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime={start_str}&endtime={end_str}&minmagnitude=4.5&limit=20000"
 
         # Сначала проверим, сколько данных пришло из API
         count_query = f"""
-        INSTALL json;
-        LOAD json;
-
+        
         WITH raw_data AS (
             SELECT unnest(features) as feature
             FROM read_json_auto('{url}')
@@ -96,18 +136,6 @@ def load_monthly_earthquake_data(**context):
 
         # Теперь загружаем данные
         query = f"""
-        SET TIMEZONE='UTC';
-        INSTALL httpfs;
-        LOAD httpfs;
-        INSTALL json;
-        LOAD json;
-        SET s3_url_style = 'path';
-        SET s3_endpoint = 'minio:9000';
-        SET s3_access_key_id = '{ACCESS_KEY}';
-        SET s3_secret_access_key = '{SECRET_KEY}';
-        SET s3_use_ssl = FALSE;
-
-        -- Распарсиваем JSON и извлекаем нужные поля
         COPY (
             SELECT 
                 feature->>'id' as earthquake_id,
@@ -131,22 +159,16 @@ def load_monthly_earthquake_data(**context):
                 FROM read_json_auto('{url}')
             )
             WHERE CAST(feature->'properties'->>'mag' AS DOUBLE) >= 4.5
-        ) TO 's3://prod/{LAYER}/{SOURCE}/year={year}/month={month:02d}/earthquakes_{start_str}.parquet'
+        ) TO '{s3_path}'
         (FORMAT 'parquet');
         """
-
         con.execute(query)
         logging.info(
-            f"✅ Данные сохранены в s3://prod/{LAYER}/{SOURCE}/year={year}/month={month:02d}/earthquakes_{start_str}.parquet")
+            f"✅ Данные сохранены в {s3_path}")
 
         # Проверяем, что файл создался
         check_query = f"""
-        SET s3_endpoint = 'minio:9000';
-        SET s3_access_key_id = '{ACCESS_KEY}';
-        SET s3_secret_access_key = '{SECRET_KEY}';
-        SET s3_use_ssl = FALSE;
-
-        SELECT COUNT(*) FROM read_parquet('s3://prod/{LAYER}/{SOURCE}/year={year}/month={month:02d}/earthquakes_{start_str}.parquet')
+        SELECT COUNT(*) FROM read_parquet('{s3_path}')
         """
 
         verify_count = con.execute(check_query).fetchone()

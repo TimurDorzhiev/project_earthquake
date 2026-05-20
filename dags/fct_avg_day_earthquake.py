@@ -17,6 +17,7 @@ TARGET_TABLE = "fct_avg_day_earthquake"
 # DWH
 PG_CONNECT = "postgres_dwh"
 
+
 LONG_DESCRIPTION = """
 # LONG DESCRIPTION
 """

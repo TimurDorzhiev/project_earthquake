@@ -207,6 +207,43 @@ marimo/_lsp/
 __marimo__/
 
 # Project
-data /
+data/
 logs/
 cred.py
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+
+# Python
+
+*.py[cod]
+
+
+
+.venv/
+
+
+# Airflow logs
+
+
+# Данные (не храним в Git!)
+*.parquet
+*.csv
+*.gz
+
+postgres_data/
+minio_data/
+
+# Секреты
+
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid

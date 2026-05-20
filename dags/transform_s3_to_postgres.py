@@ -3,160 +3,145 @@ import duckdb
 import pendulum
 from airflow import DAG
 from airflow.models import Variable
-from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
-
+from datetime import datetime
 
 OWNER = "t.dorzhiev"
-DAG_ID = "transform_earthquake_s3_to_postgres"
+DAG_ID = "transform_earthquake_unified"
 
 ACCESS_KEY = Variable.get("access_key")
 SECRET_KEY = Variable.get("secret_key")
 
 args = {
     "owner": OWNER,
-    "start_date": pendulum.datetime(2015, 1, 1, tz="UTC"),
+    "start_date": pendulum.datetime(2024, 1, 1, tz="UTC"),
     "retries": 2,
     "retry_delay": pendulum.duration(minutes=5),
 }
 
-def load_parquet_to_postgres(**context):
-    """
-        Читает Parquet файлы из MinIO и загружает в PostgreSQL
-        """
-    # Получаем год и месяц из контекста (для инкрементальной загрузки)
-    # Или загружаем все данные за раз
 
+def load_incremental_data(**context):
+    """
+    Идемпотентная загрузка данных.
+    Загружает только новые данные, которых ещё нет в PostgreSQL.
+    """
     con = duckdb.connect()
 
     try:
-        # Создаем таблицу в PostgreSQL
-        create_table_query = """
-        ATTACH 'dbname=postgres user=postgres password=postgres host=postgres_dwh port=5432' AS pg (TYPE postgres);
-        
-        CREATE SCHEMA IF NOT EXISTS pg.earthquake;
-        
-        -- Удаляем старую таблицу если есть
-        DROP TABLE IF EXISTS pg.earthquake.events;
-       
-       -- Создаем новую таблицу с правильной структурой
-        CREATE TABLE pg.earthquake.events (
-            id VARCHAR(50) PRIMARY KEY,
-            time TIMESTAMP,
-            latitude DOUBLE,
-            longitude DOUBLE,
-            depth DOUBLE,
-            mag DOUBLE,
-            magType VARCHAR(10),
-            nst INTEGER,
-            gap DOUBLE,
-            dmin DOUBLE,
-            rms DOUBLE,
-            net VARCHAR(10),
-            updated TIMESTAMP,
-            place TEXT,
-            type VARCHAR(30),
-            horizontalError DOUBLE,
-            depthError DOUBLE,
-            magError DOUBLE,
-            magNst INTEGER,
-            status VARCHAR(20),
-            locationSource VARCHAR(20),
-            magSource VARCHAR(20),
-            ingestion_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute(f"""
+            CREATE OR REPLACE SECRET minio_secret (
+                TYPE S3,
+                PROVIDER config,
+                KEY_ID '{ACCESS_KEY}',
+                SECRET '{SECRET_KEY}',
+                ENDPOINT 'minio:9000',
+                REGION 'us-east-1',
+                URL_STYLE 'path',
+                USE_SSL false
+            );
+        """)
+        logging.info("✅ Секрет создан")
+
+        con.execute("DETACH DATABASE IF EXISTS pg;")
+        con.execute("""
+            ATTACH 'dbname=postgres user=postgres password=postgres host=postgres_dwh port=5432' AS pg (TYPE postgres);
+        """)
+        logging.info("✅ Подключение к PostgreSQL")
+
+        # Создаем таблицу если не существует
+        con.execute("""
+            CREATE SCHEMA IF NOT EXISTS pg.earthquake;
+
+            CREATE TABLE IF NOT EXISTS pg.earthquake.events (
+                id VARCHAR(50) PRIMARY KEY,
+                time TIMESTAMP,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                depth DOUBLE,
+                mag DOUBLE,
+                place TEXT,
+                status VARCHAR(20),
+                year INTEGER,
+                month INTEGER,
+                ingestion_time TIMESTAMP
+            );
+        """)
+        logging.info("✅ Таблица создана/существует")
+
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # ============================================
+        # ИСПРАВЛЕННЫЙ ЗАПРОС - используем earthquake_id вместо id
+        # ============================================
+        query = f"""
+        INSERT INTO pg.earthquake.events
+        SELECT 
+            earthquake_id as id,
+            to_timestamp(timestamp_ms/1000) as time,
+            latitude,
+            longitude,
+            depth_km as depth,
+            magnitude as mag,
+            place,
+            status,
+            EXTRACT(YEAR FROM to_timestamp(timestamp_ms/1000)) as year,
+            EXTRACT(MONTH FROM to_timestamp(timestamp_ms/1000)) as month,
+            '{current_time}'::TIMESTAMP as ingestion_time
+        FROM read_parquet('s3://prod/raw/earthquake/**/*.parquet', union_by_name=True)
+        WHERE magnitude >= 4.5
+        AND earthquake_id NOT IN (
+            SELECT id FROM pg.earthquake.events
+        )
+        ON CONFLICT (id) DO NOTHING;
         """
 
-        con.execute(create_table_query)
-        logging.info("✅ Таблица создана в PostgreSQL")
+        logging.info("🔄 Выполняется загрузка данных...")
+        con.execute(query)
 
-        # Загружаем данные
-        insert_query = """
-                ATTACH 'dbname=postgres user=postgres password=postgres host=postgres_dwh port=5432' AS pg (TYPE postgres);
+        # Получаем количество загруженных записей
+        count_result = con.execute("""
+            SELECT COUNT(*) FROM pg.earthquake.events
+        """).fetchone()
 
-                INSERT INTO pg.earthquake.events
-                SELECT 
-                    id,
-                    time::TIMESTAMP as time,
-                    latitude,
-                    longitude,
-                    depth,
-                    mag,
-                    magType,
-                    nst,
-                    gap,
-                    dmin,
-                    rms,
-                    net,
-                    updated::TIMESTAMP as updated,
-                    place,
-                    type,
-                    horizontalError,
-                    depthError,
-                    magError,
-                    magNst,
-                    status,
-                    locationSource,
-                    magSource,
-                    CURRENT_TIMESTAMP as ingestion_time
-                FROM read_parquet('s3://prod/raw/earthquake/*/*.parquet')
-                ON CONFLICT (id) DO UPDATE SET
-                    mag = EXCLUDED.mag,
-                    place = EXCLUDED.place,
-                    updated = EXCLUDED.updated,
-                    status = EXCLUDED.status,
-                    ingestion_time = CURRENT_TIMESTAMP;
-                """
+        logging.info(f"📊 Всего записей в PostgreSQL: {count_result[0]}")
 
-        con.execute(insert_query)
-        logging.info("✅ Данные загружены в PostgreSQL")
+        # Статистика по годам
+        stats = con.execute("""
+            SELECT 
+                year,
+                COUNT(*) as cnt
+            FROM pg.earthquake.events
+            GROUP BY year
+            ORDER BY year;
+        """).fetchall()
 
-        # Проверяем количество записей
-        count_query = """
-                ATTACH 'dbname=postgres user=postgres password=postgres host=postgres_dwh port=5432' AS pg (TYPE postgres);
-                SELECT COUNT(*) FROM pg.earthquake.events;
-                """
-        count = con.execute(count_query).fetchone()
-        logging.info(f"📊 Всего записей в PostgreSQL: {count[0]}")
+        logging.info("📊 Результат по годам:")
+        if stats:
+            for year, cnt in stats:
+                logging.info(f"  {int(year)}: {cnt} записей")
+        else:
+            logging.info("  Нет данных")
 
-        # Показываем статистику по магнитудам
-        stats_query = """
-                ATTACH 'dbname=postgres user=postgres password=postgres host=postgres_dwh port=5432' AS pg (TYPE postgres);
-                SELECT 
-                    COUNT(*) as total_events,
-                    MIN(mag) as min_magnitude,
-                    AVG(mag) as avg_magnitude,
-                    MAX(mag) as max_magnitude,
-                    COUNT(DISTINCT place) as unique_places
-                FROM pg.earthquake.events
-                WHERE mag IS NOT NULL;
-                """
-        stats = con.execute(stats_query).fetchone()
-        logging.info(f"📊 Статистика: {stats}")
+        con.execute("DETACH DATABASE pg;")
+        logging.info("✅ Готово!")
 
     except Exception as e:
-        logging.error(f"❌ Ошибка загрузки: {e}")
+        logging.error(f"❌ Ошибка: {e}")
         raise
     finally:
         con.close()
 
-    with DAG(
-            dag_id=DAG_ID,
-            schedule_interval="@once",
-            default_args=args,
-            tags=["transform", "postgres", "earthquake"],
-            catchup=False,
-    ) as dag:
 
-        start = EmptyOperator(task_id="start")
+with DAG(
+        dag_id=DAG_ID,
+        schedule_interval="@daily",
+        default_args=args,
+        catchup=False,
+) as dag:
+    load = PythonOperator(
+        task_id="load_incremental_data",
+        python_callable=load_incremental_data,
+    )
 
-        load_to_postgres = PythonOperator(
-            task_id="load_parquet_to_postgres",
-            python_callable=load_parquet_to_postgres,
-        )
-
-        end = EmptyOperator(task_id="end")
-
-        start >> load_to_postgres >> end
-
-
+    load
